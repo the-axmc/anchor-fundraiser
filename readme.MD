@@ -54,6 +54,243 @@ the receipt stays with whoever holds it, for good. The receipt is proof, not a
 claim: it pays nothing, and holding someone else's receipt never lets you refund
 their money.
 
+### How it works
+
+**State.** Both fields are appended, so no existing offset moves.
+
+| Account | Field | Meaning |
+| --- | --- | --- |
+| `Fundraiser` | `receipts_issued: u32` | receipts issued so far, and so the last serial number; only ever goes up |
+| `Contributor` | `receipt_number: u32` | this backer's serial, from 1; `0` means no receipt yet |
+
+The receipt itself is two accounts that the backer pays for:
+
+| Account | Address | Contents |
+| --- | --- | --- |
+| receipt mint (Token-2022) | PDA `["receipt", fundraiser, contributor]` | 0 decimals, supply 1, no mint or freeze authority, MintCloseAuthority = the Fundraiser, MetadataPointer = itself (no authority), TokenMetadata with no update authority |
+| receipt token account | the backer's associated token account for that mint | the one token |
+
+The close authority doubles as a pointer back to the campaign. A mint's
+address can't be turned back into its seeds, so the close authority is how
+anyone holding a receipt can tell which Fundraiser it belongs to.
+
+**Lifecycle.**
+
+```
+contribute (first)    creates the mint and the backer's token account, mints 1,
+                      removes the mint and metadata authorities,
+                      receipt_number = ++receipts_issued
+contribute (again)    the receipt is untouched
+check_contributions   unchanged; every receipt stays with whoever holds it
+refund                supply 1: the receipt must be in the backer's own account,
+                      or ReceiptNotHeld; it is burned
+                      supply 0: already burned by its holder; nothing to burn
+                      then the token account (if still there) and the mint
+                      are closed, rent to the backer
+```
+
+**Why inside `contribute`.** If the receipt were minted by a separate optional
+instruction, "every backer has a receipt" would be a rule only the frontend
+obeys. Inside `contribute`, the program guarantees it.
+
+**Why the mint is created by hand.** The obvious tool, `init_if_needed`, has a
+trap. When the account already exists, it re-checks the mint authority
+(anchor-syn 1.1.2, `constraints.rs:1064`). Once that authority is None, **every
+second contribution would fail** with `ConstraintMintMintAuthority`. So
+`contribute` creates the mint only when its account is empty, and an empty
+receipt account is also what marks a first contribution. Only this program can
+allocate that address, so empty really means "no receipt yet". Creating it by
+hand means doing what `init` does for free:
+
+- **A pre-funded address.** Anyone can send lamports to an address before it
+  exists, and `create_account` refuses an address that holds any. Left
+  unhandled, that would lock a backer out of the campaign. The program tops the
+  account up, then calls `allocate` and `assign`, as Anchor's own `init` does.
+- **The right size.** The account is created at the size of the mint plus its
+  two fixed extensions. Token-2022 grows it when it writes the metadata, but the
+  lamports for that have to be there already. The extra is sized with
+  Token-2022's 4-byte extension header. `TokenMetadata::tlv_size_of` assumes the
+  generic 12-byte header and would over-fund every receipt by 8 bytes of rent,
+  stranded for good when the campaign succeeds. A test pins the mint to exactly
+  rent-exempt.
+
+The CPIs run in the order Token-2022 requires:
+
+1. create the account;
+2. add the close-authority and metadata-pointer extensions;
+3. initialise the mint;
+4. write the metadata;
+5. hand its update authority to None. Token-2022 refuses None at
+   initialisation, so the Fundraiser holds it for one CPI;
+6. create the backer's token account;
+7. mint 1;
+8. set the mint authority to None.
+
+**Why Token-2022 rather than the classic Token program.** A classic mint can
+never be closed, so a refunded receipt's rent, and its address, would be
+stranded for good. MintCloseAuthority lets `refund` close it. Token-2022 also
+carries the name and symbol on the mint itself. Metaplex metadata would need
+the Metaplex program, which `anchor test` and bankrun cannot run without
+cloning it in. The raised token stays on the classic Token program; only the
+receipt uses Token-2022.
+
+**The refund trap.** Four answers were weighed:
+
+| Policy | Verdict |
+| --- | --- |
+| The backer keeps the receipt | Rejected: it would be proof of backing that was taken back |
+| Soulbound (NonTransferable extension) | Removes the trap, but a receipt could never move to a new wallet or be traded, even after the campaign succeeds |
+| The Fundraiser as permanent delegate, burning it wherever it is | Tradeable, but a buyer's receipt could be revoked by someone else's refund, and wallets flag permanent-delegate mints as risky |
+| **Refund requires it back in the backer's own account** | **Chosen:** tradeable; sending it away only blocks the sender's own refund |
+
+**`refund` does the burn itself.** The backer signs `refund`, so the program
+can burn from their account. A design where the client burns first and the
+program only checks would break the original refund tests, which never burn,
+and would split one action across two instructions.
+
+**A receipt that is already burned still allows a refund.** Token-2022 always
+lets an owner burn, and wallets offer a one-click burn for unknown tokens. If
+refund demanded the receipt in that case, the backer's money would be locked in
+the vault for good, since no receipt can ever be minted again. So `refund`
+reads the supply. At 1, the receipt must be in the backer's own account. At 0,
+there is nothing left to burn. Whoever holds a receipt can release the backer's
+refund, but only by destroying it.
+
+**Why the receipt token account is checked by hand in `refund`.** A typed
+Anchor account would reject a backer who sent the receipt away and closed the
+emptied account with a generic `AccountNotInitialized`. Reading it by hand
+turns every "the receipt isn't here" case into `ReceiptNotHeld`: wrong owner,
+closed, or empty. The mint and owner need no check: the address is the backer's
+associated token account, whose owner Token-2022 makes immutable. As a second
+lock, Token-2022 refuses to close a mint whose supply is not 0. So even a wrong
+burn could not end with the refund done and the receipt still in existence.
+
+| New error | When |
+| --- | --- |
+| `ReceiptNotHeld` | `refund` while the receipt exists but is not in the backer's own associated token account |
+| `MathOverflow` | the serial counter would overflow a `u32` |
+
+New errors are appended, so 6000–6007 keep their numbers.
+
+**Tests.** `tests/nft-receipt.ts` has 12 bankrun tests, bringing the suite to 23.
+Each one asserts on accounts, not only on success.
+
+- **happy path:** the receipt minted with every authority removed; a refund
+  returning exactly the backer's rent; ten receipts surviving a successful
+  campaign, numbered #1 to #10;
+- **boundary:** one raw unit under a token mints nothing, and exactly a token
+  mints the receipt; a second contribution leaves it byte-identical; serial
+  numbers are never freed by a refund; a receipt already burned still allows a
+  refund;
+- **abuse:** `ReceiptNotHeld` while a friend holds the receipt, and after the
+  backer closed their emptied account; no second mint and no freeze; a
+  pre-funded address; another backer's receipt accounts (`ConstraintSeeds`).
+
+Nine deliberate breaks were each caught:
+
+- keeping the mint authority, the metadata update authority, or a freeze
+  authority;
+- a serial counter that never advances;
+- dropping the pre-funded-address handling;
+- over-funding the rent;
+- dropping the held check;
+- a refund that ignores the receipt;
+- a refund that refuses an already-burned receipt.
+
+### What it costs
+
+Measured on bankrun, on the base program and on this branch, both built with
+the same program ID and driven with fixed keypairs, so every PDA and bump is
+identical:
+
+| | Base | NFT receipt | Added |
+| --- | --- | --- | --- |
+| `initialize` | 45,100 CU | 45,153 CU | +53 CU (larger account) |
+| `contribute`, first | 37,232 CU | 128,389 CU | **+91,157 CU**: the receipt, 9 CPIs |
+| `contribute`, repeat | 34,588 CU | 42,259 CU | +7,671 CU: re-deriving the two receipt addresses |
+| `check_contributions` | 47,295 CU | 47,299 CU | unchanged |
+| `refund` | 23,505 CU | 50,295 CU | +26,790 CU: burn and two closes |
+| `Fundraiser` | 98 bytes, 1,572,960 lamports | 102 bytes, 1,600,800 lamports | +27,840 lamports, paid by the maker and returned at settlement |
+| `Contributor` | 16 bytes, 1,002,240 lamports | 20 bytes, 1,030,080 lamports | +27,840 lamports per backer |
+| receipt mint | n/a | 379 bytes, 3,528,720 lamports | new, per backer |
+| receipt token account | n/a | 170 bytes, 2,074,080 lamports | new, per backer |
+
+- **Rent for a backer:** a first contribution locks 6,632,880 lamports of rent
+  instead of 1,002,240, which is **+5,630,640 lamports (about 0.0056 SOL)**.
+  - On a refund, every lamport comes back (measured: net 0).
+  - On a success, it stays locked while the receipt exists. The holder can
+    burn the receipt and close their token account to recover 2,074,080
+    lamports. The mint's rent is gone for good, because only `refund` ever
+    signs as its close authority.
+  - For a cheap token, the receipt's rent can be worth more than a one-token
+    contribution.
+- **Extra accounts:** `contribute` goes from 8 accounts to 12, and `refund` from
+  9 to 13. The new ones are the Token-2022 program, the Associated Token
+  program, the receipt mint and the receipt token account. That is 128 more
+  bytes of transaction. Every one is a PDA or a fixed program ID, so clients
+  derive them, and the original tests pass unedited.
+- **Compute headroom:** a first contribution ranges from 119,389 to 137,389 CU
+  across the ten fixed backers, depending on how many tries each PDA bump
+  takes. That is within the default 200,000 per instruction. A frontend that
+  bundles other instructions with it should raise the compute limit.
+- **The repeat-contribution cost is avoidable:** the `seeds` checks re-run
+  `find_program_address` for both receipt addresses on every contribution.
+  Storing the two bumps on `Contributor` would cut most of the +7,671 CU, at a
+  cost of 2 bytes of rent per backer. It is left out to keep the state minimal.
+
+### How you would attack it
+
+1. **Pre-fund the receipt address to lock a backer out.** Refused. Sending
+   lamports to the address before the first contribution no longer blocks it
+   (tested). It costs the attacker at least the rent-exempt minimum for an
+   empty account, 890,880 lamports. The program counts those lamports toward
+   the receipt's rent, so the backer pays that much less, and gets it back on a
+   refund.
+2. **Hold a receipt hostage.** A backer who sells or lends their receipt while
+   the campaign is live gives the holder a veto over their refund. The holder
+   can keep it, return it, or burn it. That is the design working as intended:
+   the receipt cannot outlive its backing. It still means a receipt bought
+   before a campaign resolves can be used to extort the original backer. The
+   rule for backers is to not hand the receipt over until the campaign has
+   succeeded.
+3. **Buy a receipt to claim the refund.** Impossible. `refund` pays the backer
+   named by the Contributor PDA, which is derived from the signer. It burns
+   only the signer's own receipt, and another backer's receipt accounts fail
+   `ConstraintSeeds` (tested). The receipt gates a refund; it never pays one.
+4. **Destroy your own receipt.** The paragraph's "if and only if" has one
+   exception, and it is the backer themselves. Token-2022 always lets an owner
+   burn, so a backer can have committed money and no receipt. The program
+   enforces the direction that matters: a receipt never outlives its backing.
+   It also makes sure a burned receipt never locks the money in (tested).
+5. **Mint a second copy, freeze one, rename one, or repoint the metadata.** The
+   mint authority, the freeze authority, the metadata update authority and the
+   metadata-pointer authority are all None (tested). **Even an upgraded program
+   cannot destroy a held receipt.** It can close the mint only at supply 0, and
+   it cannot burn a token it does not own, because there is no permanent
+   delegate.
+6. **Fake receipts.** Anyone can create a Token-2022 mint named "Fundraiser
+   Receipt #1" with symbol `RCPT`. Metadata is not proof. A verifier must check
+   that the mint's address is the PDA
+   `["receipt", fundraiser, contributor]` under this program ID, and that its
+   close authority is that Fundraiser.
+7. **Stale Contributor PDAs from the base program.** The original program never
+   closes Contributor PDAs on success, and the maker can re-initialize at the
+   same Fundraiser address. A backer returning to campaign B therefore:
+   - already has campaign A's receipt at the same address, so gets no new
+     receipt, and A's receipt stands in for B;
+   - sees serial numbers restart at #1 in B, so two receipts can carry the same
+     name for the same Fundraiser address;
+   - if B fails, must hold A's receipt to refund B. The refund then burns proof
+     of a campaign that succeeded, on top of the base program's own bug of
+     refunding A's stale amount out of B's vault.
+
+   The seeds are fixed by the brief, so the fix is to close stale PDAs. That is
+   the lifecycle feature's job, not this one's.
+8. **Sybil backers.** The 10% per-wallet cap does not stop one person using many
+   wallets. The number of receipts counts wallets, not people. Each extra
+   wallet costs its owner about 0.0056 SOL of rent, which a successful
+   campaign never returns.
+
 This example demonstrates how to create a fundraising for SPL Tokens.
 
 In this example, a user will be able to create a fundraiser account, where he will be specify the mint he wants to collect and the fundraising target.
