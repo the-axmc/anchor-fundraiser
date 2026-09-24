@@ -20,6 +20,40 @@ The repo declares a program id it does not ship the keypair for, so your first
 `DeclaredProgramIdMismatch`. `anchor keys sync` rewrites `declare_id!` and
 `Anchor.toml` to match the keypair you just generated. Run it once, then rebuild.
 
+---
+
+## Custom feature: NFT receipt
+
+> A rule that only your TypeScript obeys is not a rule. If the program does not
+> enforce it, it does not exist.
+
+### What it does
+
+*Written before any code, and unchanged since.*
+
+**NFT receipt** gives every backer a one-of-one token proving they backed the
+campaign. On a backer's first contribution, `contribute` itself creates a
+Token-2022 mint at the PDA `["receipt", fundraiser, contributor]` with 0
+decimals. It mints exactly one token into the backer's associated token
+account, then sets the mint authority to None, so no second copy can ever
+exist. The mint has no freeze authority. It carries its own metadata, named
+"Fundraiser Receipt #N", with symbol `RCPT`, and the metadata's update authority
+is also removed. N is a serial number: the Fundraiser counts receipts in the
+order they are issued, and each Contributor records its own. Later
+contributions from the same wallet change nothing about the receipt, and a
+number is never reused. The receipt can be transferred freely, which is where
+the trap is: a backer who refunds should not keep a receipt for money they took
+back, but they could send it away first. So `refund` requires the receipt to be
+back in the backer's own token account. It burns it, closes that account and
+the mint, and returns their rent to the backer. If the receipt is anywhere else,
+`refund` fails with `ReceiptNotHeld`. Sending the receipt away does not beat the
+rule; it only blocks the sender's own refund until they get it back. The result
+is one program-enforced invariant: a receipt exists if and only if its backer's
+money is still in the vault or has gone to the maker. On a successful campaign
+the receipt stays with whoever holds it, for good. The receipt is proof, not a
+claim: it pays nothing, and holding someone else's receipt never lets you refund
+their money.
+
 This example demonstrates how to create a fundraising for SPL Tokens.
 
 In this example, a user will be able to create a fundraiser account, where he will be specify the mint he wants to collect and the fundraising target.
